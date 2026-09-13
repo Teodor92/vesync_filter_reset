@@ -1,0 +1,6 @@
+reset_filter:
+  target:
+    device:
+      integration: vesync
+    entity:
+      integration: vesync
