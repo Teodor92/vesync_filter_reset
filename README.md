@@ -30,7 +30,7 @@ talk to the VeSync cloud on its own.
 
 - The core [VeSync integration](https://www.home-assistant.io/integrations/vesync/)
   set up and loaded
-- Home Assistant 2026.1 or newer
+- Home Assistant 2026.9 or newer
 
 ## Installation
 
@@ -67,10 +67,16 @@ target:
   entity_id: fan.office_air_purifier
 ```
 
-Target any entity, device or area belonging to the purifier — the sensor, the
-fan, the child-lock switch all work, because targets are resolved to the
-underlying device. Non-VeSync devices caught by a broad area target are skipped
-silently; a VeSync device with no filter raises an error naming the model.
+Target any entity, device, area, floor or label belonging to the purifier — the
+sensor, the fan, the child-lock switch all work, because targets are resolved to
+the underlying device using Home Assistant's own target resolver. Non-VeSync
+devices caught by a broad target are skipped silently; a VeSync device with no
+resettable filter raises an error naming the model.
+
+When several purifiers are targeted at once, every one is attempted. If some
+fail, the action still resets and refreshes the rest, then reports both lists in
+a single error — it does not stop at the first failure and leave the remainder
+untouched.
 
 ### Dashboard button
 
@@ -103,6 +109,12 @@ Verified working on:
 | LAP-C601S-WEU (Core600S) | `VeSyncAirBypass` |
 | LAP-V102S-WEU (Vital 100S) | `VeSyncAirBaseV2` |
 
+**Not supported:** `VeSyncAir131` (LV-PUR131S) and `VeSyncAirRH131`. Both are
+purifiers and both have a `reset_filter` attribute, but they inherit the base
+class no-op, which returns `False` without ever calling the API. This
+integration detects that the method is not overridden and refuses up front,
+rather than reporting a cloud rejection that never happened.
+
 Note that `pyvesync`'s `device_map.py` only declares the
 `PurifierFeatures.RESET_FILTER` flag for `Core200S` and `CS137-AF`. That flag is
 **not** checked by `reset_filter()`, which is why the models above work anyway —
@@ -121,13 +133,19 @@ only in the log:
 | --- | --- |
 | `No target supplied` | Action called with no target |
 | `No VeSync devices matched the supplied target` | Target contained no VeSync devices |
-| `... is not loaded` | The VeSync config entry is not currently loaded |
-| `... has no filter to reset` | Targeted a VeSync device that isn't a purifier |
-| `pyvesync has no device with cid ...` | Registry and library are out of sync — reload the VeSync integration |
-| `VeSync rejected the filter reset for ...` | The API returned failure for this model |
+| `The VeSync config entry for ... is not loaded` | No loaded vesync entry for that device |
+| `... does not support filter reset` | Device isn't a purifier, or is one whose pyvesync class doesn't override the stub |
+| `Incompatible VeSync integration version` | `runtime_data` no longer exposes the pyvesync manager |
+| `no loaded VeSync entry has a device with cid ...` | Registry and library are out of sync — reload the VeSync integration |
+| `Filter reset succeeded for: ... Failed: ...` | One or more targets failed; the listed successes did complete and were refreshed |
+
+Failures against the cloud quote VeSync's own reason where the API supplies one,
+rather than a generic message.
 
 After a successful reset the integration requests a coordinator refresh, so the
 filter-life sensor updates immediately instead of at the next poll.
+`reset_filter()` does not update local state, so this step is required, not
+cosmetic.
 
 ## Licence
 

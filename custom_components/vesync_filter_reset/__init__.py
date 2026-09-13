@@ -12,6 +12,7 @@ object already authenticated by the core integration, reached via
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -20,7 +21,9 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import target as target_helpers
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,33 +33,29 @@ SERVICE_RESET_FILTER = "reset_filter"
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
-SERVICE_SCHEMA = vol.Schema(
-    {
-        vol.Optional("entity_id"): cv.entity_ids,
-        vol.Optional("device_id"): vol.All(cv.ensure_list, [cv.string]),
-        vol.Optional("area_id"): vol.All(cv.ensure_list, [cv.string]),
-    }
-)
+# Home Assistant merges the whole target dict into the call data before
+# validating, so the schema has to accept every target key -- including
+# floor_id and label_id, which the UI target picker offers.
+SERVICE_SCHEMA = vol.Schema(cv.TARGET_SERVICE_FIELDS)
 
 
 def _collect_device_ids(hass: HomeAssistant, call: ServiceCall) -> set[str]:
-    """Resolve whatever the caller targeted down to device registry IDs."""
-    dev_reg = dr.async_get(hass)
+    """Resolve whatever the caller targeted down to device registry IDs.
+
+    Delegated to Home Assistant's own resolver rather than walking the
+    registries by hand: that gets floor and label targets, entity-registry
+    UUIDs, the `none` sentinel and composite devices for free.
+    """
     ent_reg = er.async_get(hass)
 
-    device_ids: set[str] = set(call.data.get("device_id", []))
+    selection = target_helpers.TargetSelection(call.data)
+    referenced = target_helpers.async_extract_referenced_entity_ids(hass, selection)
 
-    for entity_id in call.data.get("entity_id", []):
+    device_ids: set[str] = set(referenced.referenced_devices)
+    for entity_id in referenced.referenced | referenced.indirectly_referenced:
         entity = ent_reg.async_get(entity_id)
         if entity is not None and entity.device_id:
             device_ids.add(entity.device_id)
-
-    for area_id in call.data.get("area_id", []):
-        for device in dr.async_entries_for_area(dev_reg, area_id):
-            device_ids.add(device.id)
-        for entity in er.async_entries_for_area(ent_reg, area_id):
-            if entity.device_id:
-                device_ids.add(entity.device_id)
 
     return device_ids
 
@@ -69,30 +68,101 @@ def _vesync_cid(device_entry: dr.DeviceEntry) -> str | None:
     return None
 
 
-def _vesync_config_entry(
+def _vesync_config_entries(
     hass: HomeAssistant, device_entry: dr.DeviceEntry
-) -> ConfigEntry | None:
-    """Find the vesync config entry backing a device (core supports several)."""
+) -> list[ConfigEntry]:
+    """Every vesync config entry this device is linked to.
+
+    ``device_entry.config_entries`` is a set, and core supports several vesync
+    entries, so callers must not assume there is exactly one.
+    """
+    entries = []
     for entry_id in device_entry.config_entries:
         entry = hass.config_entries.async_get_entry(entry_id)
         if entry is not None and entry.domain == VESYNC_DOMAIN:
-            return entry
-    return None
+            entries.append(entry)
+    return entries
 
 
-def _find_pyvesync_device(manager, cid: str):
+def _manager_for(entry: ConfigEntry) -> Any | None:
+    """Reach the pyvesync manager without assuming runtime_data's shape.
+
+    vesync is quality_scale bronze, so this layout is not a public contract.
+    Returning None lets the caller raise something readable instead of an
+    AttributeError traceback.
+    """
+    return getattr(entry.runtime_data, "manager", None)
+
+
+def _find_pyvesync_device(manager: Any, cid: str) -> Any | None:
     """Match a registry identifier back to a live pyvesync device object.
 
-    VeSyncBaseEntity.base_unique_id is ``cid`` or ``cid + sub_device_no``,
-    so both forms are accepted.
+    VeSyncBaseEntity.base_unique_id is ``cid`` or ``cid + sub_device_no``;
+    reconstruct the same key rather than matching either form loosely.
     """
     for device in manager.devices:
-        if device.cid == cid:
-            return device
         sub = device.sub_device_no
-        if isinstance(sub, int) and f"{device.cid}{sub}" == cid:
+        key = f"{device.cid}{sub}" if isinstance(sub, int) else device.cid
+        if key == cid:
             return device
     return None
+
+
+def _supports_filter_reset(device: Any) -> bool:
+    """True only when the device class actually overrides pyvesync's stub.
+
+    Every VeSyncPurifier carries a ``reset_filter`` attribute, but the base
+    class implementation is a no-op returning False without calling the API --
+    VeSyncAir131 (LV-PUR131S) and VeSyncAirRH131 inherit it. hasattr() cannot
+    tell those apart from a real implementation, so check for the override.
+    """
+    try:
+        from pyvesync.base_devices.purifier_base import VeSyncPurifier
+    except ImportError:
+        # pyvesync moved this path between 2.x and 3.x. Fall back to the
+        # loose check rather than failing outright.
+        return hasattr(device, "reset_filter")
+
+    if not isinstance(device, VeSyncPurifier):
+        return False
+    return type(device).reset_filter is not VeSyncPurifier.reset_filter
+
+
+def _rejection_reason(device: Any) -> str:
+    """Pull VeSync's own reason out of the last response, when there is one."""
+    response = getattr(device, "last_response", None)
+    message = getattr(response, "message", None)
+    return message or "VeSync rejected the request"
+
+
+def _resolve_target(
+    hass: HomeAssistant, device_entry: dr.DeviceEntry, cid: str, name: str
+) -> tuple[ConfigEntry, Any]:
+    """Find the loaded vesync entry that actually knows this device."""
+    entries = _vesync_config_entries(hass, device_entry)
+    if not entries:
+        raise HomeAssistantError(f"No VeSync config entry found for {name}.")
+
+    for entry in entries:
+        if entry.state is not ConfigEntryState.LOADED:
+            continue
+        manager = _manager_for(entry)
+        if manager is None:
+            raise HomeAssistantError(
+                f"Incompatible VeSync integration version: cannot reach the "
+                f"pyvesync manager for {name}."
+            )
+        device = _find_pyvesync_device(manager, cid)
+        if device is not None:
+            return entry, device
+
+    if not any(entry.state is ConfigEntryState.LOADED for entry in entries):
+        raise HomeAssistantError(f"The VeSync config entry for {name} is not loaded.")
+
+    raise HomeAssistantError(
+        f"{name} is in the device registry but no loaded VeSync entry has a device "
+        f"with cid {cid}. Try reloading the VeSync integration."
+    )
 
 
 async def _async_reset_filter(call: ServiceCall) -> None:
@@ -103,10 +173,11 @@ async def _async_reset_filter(call: ServiceCall) -> None:
     device_ids = _collect_device_ids(hass, call)
     if not device_ids:
         raise HomeAssistantError(
-            "No target supplied. Target a VeSync purifier entity, device or area."
+            "No target supplied. Target a VeSync purifier entity, device, area, "
+            "floor or label."
         )
 
-    targets = []
+    targets: list[tuple[str, ConfigEntry, Any]] = []
     for device_id in device_ids:
         device_entry = dev_reg.async_get(device_id)
         if device_entry is None:
@@ -114,28 +185,15 @@ async def _async_reset_filter(call: ServiceCall) -> None:
 
         cid = _vesync_cid(device_entry)
         if cid is None:
-            # Not a VeSync device. Skip quietly so area targets stay usable.
+            # Not a VeSync device. Skip quietly so broad targets stay usable.
             continue
 
         name = device_entry.name_by_user or device_entry.name or device_id
+        entry, device = _resolve_target(hass, device_entry, cid, name)
 
-        entry = _vesync_config_entry(hass, device_entry)
-        if entry is None:
-            raise HomeAssistantError(f"No VeSync config entry found for {name}.")
-        if entry.state is not ConfigEntryState.LOADED:
+        if not _supports_filter_reset(device):
             raise HomeAssistantError(
-                f"The VeSync config entry for {name} is not loaded."
-            )
-
-        device = _find_pyvesync_device(entry.runtime_data.manager, cid)
-        if device is None:
-            raise HomeAssistantError(
-                f"{name} is in the device registry but pyvesync has no device with "
-                f"cid {cid}. Try reloading the VeSync integration."
-            )
-        if not hasattr(device, "reset_filter"):
-            raise HomeAssistantError(
-                f"{name} ({device.device_type}) has no filter to reset."
+                f"{name} ({device.device_type}) does not support filter reset."
             )
 
         targets.append((name, entry, device))
@@ -143,26 +201,45 @@ async def _async_reset_filter(call: ServiceCall) -> None:
     if not targets:
         raise HomeAssistantError("No VeSync devices matched the supplied target.")
 
+    succeeded: list[str] = []
+    failed: list[str] = []
     entries_to_refresh: dict[str, ConfigEntry] = {}
-    for name, entry, device in targets:
-        _LOGGER.debug("Resetting filter life for %s (%s)", name, device.device_type)
-        try:
-            reset_ok = await device.reset_filter()
-        except Exception as err:
-            raise HomeAssistantError(f"Filter reset failed for {name}: {err}") from err
 
-        if not reset_ok:
-            raise HomeAssistantError(
-                f"VeSync rejected the filter reset for {name} ({device.device_type}). "
-                "The device may not support the resetFilter command."
-            )
+    try:
+        # Sequential on purpose: pyvesync raises VeSyncRateLimitError, so firing
+        # these concurrently trades one problem for another.
+        for name, entry, device in targets:
+            _LOGGER.debug("Resetting filter life for %s (%s)", name, device.device_type)
+            try:
+                reset_ok = await device.reset_filter()
+            except Exception as err:
+                # Broad by design: every pyvesync and aiohttp failure should
+                # reach the user as a readable error, not a log-only traceback.
+                # CancelledError is a BaseException, so it still propagates.
+                failed.append(f"{name}: {err}")
+                continue
 
-        _LOGGER.info("Filter life reset to 100%% for %s", name)
-        entries_to_refresh[entry.entry_id] = entry
+            if not reset_ok:
+                failed.append(f"{name}: {_rejection_reason(device)}")
+                continue
 
-    # Pull the new filter_life straight away instead of waiting for the next poll.
-    for entry in entries_to_refresh.values():
-        await entry.runtime_data.async_request_refresh()
+            _LOGGER.info("Filter life reset to 100%% for %s", name)
+            succeeded.append(name)
+            entries_to_refresh[entry.entry_id] = entry
+    finally:
+        # Always refresh whatever succeeded, even if a later target failed --
+        # reset_filter does not update state locally, so without this the
+        # filter-life sensor keeps reporting the old value until the next poll.
+        for entry in entries_to_refresh.values():
+            coordinator = entry.runtime_data
+            if isinstance(coordinator, DataUpdateCoordinator):
+                await coordinator.async_request_refresh()
+
+    if failed:
+        raise HomeAssistantError(
+            f"Filter reset succeeded for: {', '.join(succeeded) or 'none'}. "
+            f"Failed: {'; '.join(failed)}"
+        )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
