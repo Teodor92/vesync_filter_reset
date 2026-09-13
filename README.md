@@ -147,6 +147,16 @@ filter-life sensor updates immediately instead of at the next poll.
 `reset_filter()` does not update local state, so this step is required, not
 cosmetic.
 
+## Icon
+
+`custom_components/vesync_filter_reset/brand/` carries the icon HACS displays.
+It reuses VeSync's brand green (`#17B68B` → `#0AA67F`, sampled from the asset in
+[home-assistant/brands](https://github.com/home-assistant/brands/tree/master/core_integrations/vesync))
+and their corner radius, with a reset glyph in place of the wordmark — related
+by colour, without presenting itself as an official VeSync integration. The
+wordmark was dropped because it is unreadable at the 32–48px these are actually
+rendered at.
+
 ## Licence
 
 Apache-2.0

@@ -14,8 +14,3 @@ jobs:
       - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main @ 2026-09
         with:
           category: integration
-          # Brands are for repositories published in the HACS default store.
-          # This one is installed as a custom repository, so the check is not
-          # applicable. Drop this ignore if brand assets are ever added under
-          # custom_components/vesync_filter_reset/brand/.
-          ignore: brands
