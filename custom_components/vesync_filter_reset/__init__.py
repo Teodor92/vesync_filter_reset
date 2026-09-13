@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
@@ -63,7 +62,7 @@ def _collect_device_ids(hass: HomeAssistant, call: ServiceCall) -> set[str]:
 
 
 def _vesync_cid(device_entry: dr.DeviceEntry) -> str | None:
-    """Return the VeSync identifier the core integration registered this device under."""
+    """Return the VeSync identifier this device is registered under."""
     for domain, identifier in device_entry.identifiers:
         if domain == VESYNC_DOMAIN:
             return identifier
@@ -90,9 +89,9 @@ def _find_pyvesync_device(manager, cid: str):
     for device in manager.devices:
         if device.cid == cid:
             return device
-        if isinstance(device.sub_device_no, int):
-            if f"{device.cid}{device.sub_device_no}" == cid:
-                return device
+        sub = device.sub_device_no
+        if isinstance(sub, int) and f"{device.cid}{sub}" == cid:
+            return device
     return None
 
 
@@ -124,7 +123,9 @@ async def _async_reset_filter(call: ServiceCall) -> None:
         if entry is None:
             raise HomeAssistantError(f"No VeSync config entry found for {name}.")
         if entry.state is not ConfigEntryState.LOADED:
-            raise HomeAssistantError(f"The VeSync config entry for {name} is not loaded.")
+            raise HomeAssistantError(
+                f"The VeSync config entry for {name} is not loaded."
+            )
 
         device = _find_pyvesync_device(entry.runtime_data.manager, cid)
         if device is None:
